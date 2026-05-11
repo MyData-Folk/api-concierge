@@ -1,0 +1,8 @@
+{
+  "name": "ParisLocal Onboarding Expert",
+  "description": "Système expert d'onboarding automatisé pour la conciergerie digitale ParisLocal. Collecte de données urbaines asynchrone (OSM/Wiki).",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": []
+}
