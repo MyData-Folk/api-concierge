@@ -231,18 +231,35 @@ app.post("/api/onboard", async (req, res) => {
       const fileName = `export_${hotel_name.replace(/\s+/g, '_')}_${Date.now()}.json`;
       fs.writeFileSync(path.join(exportDir, fileName), JSON.stringify(result, null, 2));
       console.log(`💾 JSON Exporté: ${fileName}`);
-    } catch (e) { console.error("Err Export JSON"); }
-
-    if (supabase) {
-      await supabase.from("hotels_data").upsert({ hotel_name, data: result, updated_at: new Date().toISOString() });
+      (result as any).export_file = fileName;
+    } catch (e: any) { 
+      console.error("❌ Erreur Export JSON:", e.message); 
     }
 
-    res.json({ ...result, export_file: fileName });
+    if (supabase) {
+      try {
+        const { error } = await supabase.from("hotels_data").upsert({ 
+          hotel_name, 
+          data: result, 
+          updated_at: new Date().toISOString() 
+        });
+        if (error) console.error("⚠️ Erreur Supabase Upsert:", error.message);
+        else console.log(`✅ Supabase Sync: ${hotel_name}`);
+      } catch (dbErr: any) {
+        console.error("⚠️ Échec connexion Supabase:", dbErr.message);
+      }
+    }
+
+    res.json(result);
 
   } catch (error: any) {
     metrics.errors++;
-    console.error(`❌ Erreur Onboarding: ${error.message}`);
-    res.status(500).json({ error: error.message });
+    console.error(`🛑 ERREUR CRITIQUE PIPELINE [${hotel_name}]:`, error.stack || error.message);
+    res.status(500).json({ 
+      error: "Erreur interne du pipeline", 
+      details: error.message,
+      step: "global" 
+    });
   }
 });
 
