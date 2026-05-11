@@ -149,16 +149,25 @@ export default function App() {
       
       clearInterval(interval);
       
-      if (!response.ok) throw new Error('Erreur réseau');
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.details || errData.error || 'Erreur réseau');
+      }
       
       const data = await response.json();
+      console.log('✅ Données reçues:', data);
+      
+      if (!data.pois || data.pois.length === 0) {
+        console.warn('⚠️ Aucun POI trouvé pour cet établissement.');
+      }
+
       setProgress(100);
       setStatusText('Analyse terminée.');
       setResults(data);
     } catch (e: any) {
       clearInterval(interval);
-      console.error(e);
-      alert(e.message === 'Erreur réseau' ? "Erreur lors de la collecte. Veuillez vérifier l'adresse." : "Une erreur inattendue est survenue.");
+      console.error('❌ Erreur Onboarding:', e);
+      alert(`Erreur: ${e.message}`);
     } finally {
       setLoading(false);
     }
