@@ -415,6 +415,20 @@ export default function App() {
                     ) : (
                       <p className="text-slate-500 italic">Données historiques indisponibles pour ce secteur.</p>
                     )}
+
+                    {results.site_official && (
+                      <div className="mt-8 pt-8 border-t border-slate-800/50">
+                        <div className="flex items-center gap-2 mb-4 text-emerald-400">
+                          <Globe size={16} />
+                          <h4 className="text-[10px] font-bold uppercase tracking-[0.2em]">Scraping Site Officiel</h4>
+                        </div>
+                        <div className="bg-black/20 p-4 rounded-2xl border border-slate-800">
+                           <p className="text-white font-bold text-sm mb-1">{results.site_official.title || "Pas de titre"}</p>
+                           <p className="text-slate-500 text-xs leading-relaxed">{results.site_official.description || "Pas de méta-description trouvée."}</p>
+                           {results.site_official.h1 && <p className="text-[10px] text-blue-500 mt-2 font-mono uppercase">H1: {results.site_official.h1}</p>}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* POI Data Grid */}
@@ -469,9 +483,22 @@ export default function App() {
 
                 {/* Bottom Action */}
                 <div className="flex items-center justify-between bg-blue-600/5 border border-blue-500/20 p-8 rounded-[2rem] mt-8">
-                  <div>
-                    <h4 className="text-white font-bold mb-1">Prêt pour la synchronisation</h4>
-                    <p className="text-slate-500 text-xs">Vérifiez les données avant de pousser l'hôtel dans l'écosystème ParisLocal.</p>
+                  <div className="flex items-center gap-4">
+                    <button 
+                      onClick={() => {
+                        if (results.export_file) {
+                          window.open(`/api/download/${results.export_file}`, '_blank');
+                        }
+                      }}
+                      className="bg-slate-800 hover:bg-slate-700 text-white px-6 py-4 rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 border border-slate-700"
+                    >
+                      <Database size={18} />
+                      Exporter JSON
+                    </button>
+                    <div>
+                      <h4 className="text-white font-bold mb-1">Prêt pour la synchronisation</h4>
+                      <p className="text-slate-500 text-xs">Vérifiez les données avant de pousser l'hôtel dans l'écosystème ParisLocal.</p>
+                    </div>
                   </div>
                   <button className="bg-blue-600 hover:bg-blue-500 text-white px-10 py-4 rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 shadow-2xl shadow-blue-900/40 group">
                     Publier l'Hôtel
