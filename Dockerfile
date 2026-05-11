@@ -13,6 +13,9 @@ RUN npm install
 # Copier le reste du code
 COPY . .
 
+# Créer les dossiers nécessaires avec permissions
+RUN mkdir -p exports src/data && chmod -R 777 exports src/data
+
 # Construire le frontend Admin (Vite)
 RUN npm run build
 

@@ -18,7 +18,7 @@ const supabaseUrl = process.env.SUPABASE_URL || "";
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
 const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
-// Métriques (In-Memory avec Persistance Temporelle en Log)
+// Métriques (In-Memory)
 let metrics = {
   onboardings_count: 0,
   last_extraction: null as string | null,
@@ -44,7 +44,7 @@ try {
     }));
     console.log(`✅ Base Hotels: ${hotelDb.length} chargés.`);
   }
-} catch (e) { console.error("Base Hotels non trouvée."); }
+} catch (e) { console.error("⚠️ Base Hotels non trouvée."); }
 
 const hotelFuse = new Fuse(hotelDb, { keys: ["nom", "adresse"], threshold: 0.3 });
 
@@ -80,7 +80,7 @@ async function scrapeSite(url: string) {
   if (!url) return null;
   try {
     const target = url.startsWith("http") ? url : `https://${url}`;
-    const res = await axios.get(target, { timeout: 5000 });
+    const res = await axios.get(target, { timeout: 5000, headers: { "User-Agent": "ParisLocal-App/1.0" } });
     const title = res.data.match(/<title>(.*?)<\/title>/i)?.[1];
     const desc = res.data.match(/<meta name="description" content="(.*?)"/i)?.[1];
     return { title, description: desc };
@@ -93,12 +93,24 @@ app.post("/api/onboard", async (req, res) => {
   const set = custom_settings || scrapingSettings;
 
   try {
-    // 1. GEOCODAGE
-    const geo = await axios.get(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(hotel_address)}&format=json&addressdetails=1&limit=1`, {
-      headers: { "User-Agent": "ParisLocal-App" }
+    console.log(`🚀 Début onboarding pour: ${hotel_name}`);
+
+    // 1. GEOCODAGE (Strict Headers)
+    const geo = await axios.get(`https://nominatim.openstreetmap.org/search`, {
+      params: { q: hotel_address, format: "json", addressdetails: 1, limit: 1 },
+      headers: { 
+        "User-Agent": "ParisLocal-Digital-Concierge/1.0 (contact: admin@hotelmanager.fr)",
+        "Referer": "https://hotel.hotelmanager.fr"
+      },
+      timeout: 8000
     });
     
-    if (!geo.data[0]) throw new Error("Adresse non trouvée");
+    if (!geo.data[0]) {
+       metrics.errors++;
+       console.error(`❌ Nominatim: Aucune adresse trouvée pour "${hotel_address}"`);
+       return res.status(404).json({ error: "Adresse non trouvée" });
+    }
+
     const loc = geo.data[0];
     const coords = {
       lat: parseFloat(loc.lat),
@@ -106,7 +118,9 @@ app.post("/api/onboard", async (req, res) => {
       suburb: loc.address.suburb || loc.address.neighbourhood || loc.address.city_district || "Paris"
     };
 
-    // 2. OSM SCRAPING
+    console.log(`📍 Coordonnées: ${coords.lat}, ${coords.lng} (${coords.suburb})`);
+
+    // 2. OSM SCRAPING (Fallback + Headers)
     const sources = [
       ...set.categories.map((c: string) => ({
         id: c,
@@ -119,15 +133,18 @@ app.post("/api/onboard", async (req, res) => {
     ];
 
     const pois: any[] = [];
+    const osmHeaders = { "User-Agent": "ParisLocal-Digital-Concierge/1.0", "Content-Type": "application/x-www-form-urlencoded" };
+
     for (const s of sources) {
       try {
-        const query = `[out:json];(${s.tags}(around:${s.radius},${coords.lat},${coords.lng}););out;`;
-        // Fallback servers
+        const query = `[out:json][timeout:25];(${s.tags}(around:${s.radius},${coords.lat},${coords.lng}););out body;`;
         let osmRes;
+        
         try {
-          osmRes = await axios.post("https://overpass-api.de/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 10000 });
-        } catch {
-          osmRes = await axios.post("https://overpass.openstreetmap.fr/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 10000 });
+          osmRes = await axios.post("https://overpass-api.de/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 12000, headers: osmHeaders });
+        } catch (e1: any) {
+          console.warn(`⚠️ Overpass DE échoué, essai sur FR...`);
+          osmRes = await axios.post("https://overpass.openstreetmap.fr/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 12000, headers: osmHeaders });
         }
         
         const elements = osmRes.data.elements || [];
@@ -143,10 +160,12 @@ app.post("/api/onboard", async (req, res) => {
       } catch (e) { console.error(`Err OSM ${s.id}`); }
     }
 
-    // 3. WIKI & SITE
+    console.log(`✅ ${pois.length} POIs trouvés.`);
+
+    // 3. WIKIPEDIA
     let wikiTerm = coords.suburb;
     if (set.wiki_search_mode === "metro") {
-      const metro = pois.find(p => p.category === "transport");
+      const metro = pois.find(p => p.category === "transport" && (p.name.toLowerCase().includes("métro") || p.name.toLowerCase().includes("station")));
       if (metro) wikiTerm = metro.name.replace(/métro|station/gi, "").trim();
     }
     
@@ -165,25 +184,28 @@ app.post("/api/onboard", async (req, res) => {
       timestamp: new Date().toISOString()
     };
 
-    // 4. PERSISTANCE & EXPORT JSON
+    // 4. PERSISTANCE & EXPORT
     metrics.onboardings_count++;
     metrics.api_hits += result.pois.length;
     metrics.last_extraction = hotel_name;
 
-    // Sauvegarde locale (Le fameux export JSON demandé)
-    const exportDir = path.join(process.cwd(), "exports");
-    if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir);
-    const fileName = `export_${hotel_name.replace(/\s+/g, '_')}_${Date.now()}.json`;
-    fs.writeFileSync(path.join(exportDir, fileName), JSON.stringify(result, null, 2));
+    try {
+      const exportDir = path.join(process.cwd(), "exports");
+      if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir);
+      const fileName = `export_${hotel_name.replace(/\s+/g, '_')}_${Date.now()}.json`;
+      fs.writeFileSync(path.join(exportDir, fileName), JSON.stringify(result, null, 2));
+      console.log(`💾 JSON Exporté: ${fileName}`);
+    } catch (e) { console.error("Err Export JSON"); }
 
     if (supabase) {
       await supabase.from("hotels_data").upsert({ hotel_name, data: result, updated_at: new Date().toISOString() });
     }
 
-    res.json({ ...result, export_file: fileName });
+    res.json(result);
 
   } catch (error: any) {
     metrics.errors++;
+    console.error(`❌ Erreur Onboarding: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
