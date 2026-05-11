@@ -4,6 +4,7 @@ export interface GeoCoordinates {
   address: string;
   suburb: string;
   district: string;
+  postcode?: string;
 }
 
 export interface POI {
@@ -11,6 +12,8 @@ export interface POI {
   name: string;
   category: string;
   distance_m: number;
+  address?: string;
+  phone?: string;
   lat: number;
   lng: number;
   source: string;

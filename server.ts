@@ -58,6 +58,13 @@ let scrapingSettings = {
   custom_sources: [] as any[]
 };
 
+const cat_mapping: Record<string, string> = {
+  tourism: 'tourism',
+  transport: 'transport',
+  shop: 'shop',
+  health: 'health'
+};
+
 app.get("/api/metrics", (req, res) => res.json({ ...metrics, status: "Active", uptime: process.uptime() }));
 app.get("/api/settings", (req, res) => res.json(scrapingSettings));
 app.post("/api/settings", (req, res) => {
@@ -144,16 +151,17 @@ app.post("/api/onboard", async (req, res) => {
     const coords = {
       lat: parseFloat(loc.lat),
       lng: parseFloat(loc.lon),
-      suburb: loc.address.suburb || loc.address.neighbourhood || loc.address.city_district || "Paris"
+      suburb: loc.address.suburb || loc.address.neighbourhood || loc.address.city_district || "Paris",
+      postcode: loc.address.postcode || ""
     };
 
-    console.log(`📍 Coordonnées: ${coords.lat}, ${coords.lng} (${coords.suburb})`);
+    console.log(`📍 Coordonnées: ${coords.lat}, ${coords.lng} (${coords.suburb}, ${coords.postcode})`);
 
     // 2. OSM SCRAPING (Fallback + Headers)
     const sources = [
       ...set.categories.map((c: string) => ({
         id: c,
-        radius: set.osm_radius[c] || 500,
+        radius: set.osm_radius[cat_mapping[c] || c] || 500,
         tags: c === "transport" ? 'node["railway"~"subway|station"]' :
               c === "tourism" ? 'node["tourism"~"museum|attraction"]' :
               c === "shop" ? 'node["shop"~"bakery|supermarket"]' : 'node["amenity"~"pharmacy"]'
@@ -172,17 +180,20 @@ app.post("/api/onboard", async (req, res) => {
         try {
           osmRes = await axios.post("https://overpass-api.de/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 12000, headers: osmHeaders });
         } catch (e1: any) {
-          console.warn(`⚠️ Overpass DE échoué, essai sur FR...`);
           osmRes = await axios.post("https://overpass.openstreetmap.fr/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 12000, headers: osmHeaders });
         }
         
         const elements = osmRes.data.elements || [];
         elements.forEach((el: any) => {
+          const t = el.tags || {};
+          const addr = t["addr:full"] || `${t["addr:housenumber"] || ""} ${t["addr:street"] || ""}`.trim();
           pois.push({
             id: el.id,
-            name: el.tags.name || el.tags.operator || s.id,
+            name: t.name || t.operator || s.id,
             category: s.id,
             distance_m: getDist(coords.lat, coords.lng, el.lat, el.lon),
+            address: addr || "Adresse non renseignée",
+            phone: t.phone || t["contact:phone"] || "N/A",
             lat: el.lat, lng: el.lon
           });
         });
@@ -206,8 +217,9 @@ app.post("/api/onboard", async (req, res) => {
       console.warn(`[Wiki] Échec pour ${wikiTerm}`);
     }
 
+    const full_website_url = website_url ? (website_url.startsWith('http') ? website_url : `https://${website_url}`) : '';
     const [siteData] = await Promise.all([
-      scrapeSite(website_url)
+      scrapeSite(full_website_url)
     ]);
 
     const result = {
@@ -216,7 +228,7 @@ app.post("/api/onboard", async (req, res) => {
       pois: pois.sort((a,b) => a.distance_m - b.distance_m).slice(0, 50),
       wiki: wikiData,
       site_official: siteData,
-      website_url,
+      website_url: full_website_url,
       timestamp: new Date().toISOString()
     };
 

@@ -42,6 +42,7 @@ export default function App() {
   // UI State
   const [showConfig, setShowConfig] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [filterCat, setFilterCat] = useState('all');
   
   // Scraping Settings State
   const [settings, setSettings] = useState({
@@ -367,9 +368,10 @@ export default function App() {
                 className="space-y-6"
               >
                 {/* Stats Cards */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <ScoreCard icon={<MapPin className="text-rose-400" />} label="Localisation" value={results.coords.suburb} sub={results.coords.district} />
-                  <ScoreCard icon={<History className="text-amber-400" />} label="Arrondissement" value={results.coords.district} sub="Région Parisienne" />
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <ScoreCard icon={<MapPin className="text-rose-400" />} label="Localisation" value={results.coords.suburb} sub={results.coords.postcode} />
+                  <ScoreCard icon={<Shield className="text-blue-400" />} label="Code Postal" value={results.coords.postcode || "75000"} sub="Vérification Geo" />
+                  <ScoreCard icon={<History className="text-amber-400" />} label="Arrondissement" value={results.coords.district || results.coords.suburb} sub="Région Parisienne" />
                   <ScoreCard icon={<CheckCircle2 className="text-emerald-400" />} label="POI Collectés" value={results.pois.length.toString()} sub="Points d'intérêt" />
                 </div>
 
@@ -443,10 +445,23 @@ export default function App() {
                   {/* POI Data Grid */}
                   <div className="bg-[#0d1117] rounded-3xl border border-slate-800 shadow-2xl overflow-hidden">
                     <div className="px-8 py-6 border-b border-slate-800 flex items-center justify-between bg-[#161b22]/50">
-                      <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em] flex items-center gap-2">
-                        <Navigation size={14} className="text-blue-500" />
-                        Infrastructure Locale
-                      </h4>
+                      <div className="flex items-center gap-6">
+                        <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em] flex items-center gap-2">
+                          <Navigation size={14} className="text-blue-500" />
+                          Infrastructure Locale
+                        </h4>
+                        <div className="flex gap-2">
+                          {['all', 'tourism', 'transport', 'shop', 'health'].map(cat => (
+                            <button 
+                              key={cat}
+                              onClick={() => setFilterCat(cat)}
+                              className={`px-3 py-1 rounded-full text-[9px] font-bold uppercase transition-all ${filterCat === cat ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-500 hover:text-slate-300'}`}
+                            >
+                              {cat}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                     </div>
                     
                     <div className="overflow-x-auto">
@@ -455,14 +470,18 @@ export default function App() {
                           <tr>
                             <th className="px-8 py-4 text-[10px] font-bold uppercase tracking-wider">Établissement</th>
                             <th className="px-8 py-4 text-[10px] font-bold uppercase tracking-wider">Catégorie</th>
+                            <th className="px-8 py-4 text-[10px] font-bold uppercase tracking-wider">Adresse & Contact</th>
                             <th className="px-8 py-4 text-[10px] font-bold uppercase tracking-wider text-right">Distance</th>
-                            <th className="px-8 py-4 text-[10px] font-bold uppercase tracking-wider">Fiabilité</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/50">
-                          {results.pois.map((poi, idx) => (
+                          {results.pois
+                            .filter(poi => filterCat === 'all' || poi.category === filterCat)
+                            .map((poi: any, idx: number) => (
                             <tr key={idx} className="hover:bg-slate-800/30 transition-colors group">
-                              <td className="px-8 py-5 text-sm font-semibold text-slate-200 group-hover:text-white transition-colors">{poi.name}</td>
+                              <td className="px-8 py-5">
+                                <p className="text-sm font-semibold text-slate-200 group-hover:text-white transition-colors">{poi.name}</p>
+                              </td>
                               <td className="px-8 py-5">
                                 <span className={`px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest border ${
                                   poi.category === 'tourism' ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
@@ -473,15 +492,11 @@ export default function App() {
                                   {poi.category}
                                 </span>
                               </td>
-                              <td className="px-8 py-5 text-right font-mono text-xs text-slate-500">{poi.distance_m}m</td>
                               <td className="px-8 py-5">
-                                <div className="flex items-center gap-2">
-                                  <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" />
-                                  <span className="text-[10px] font-bold text-slate-500 uppercase">
-                                    Donnée Vérifiée
-                                  </span>
-                                </div>
+                                <p className="text-[10px] text-slate-400 mb-1">{poi.address}</p>
+                                <p className="text-[10px] text-blue-400 font-mono">{poi.phone}</p>
                               </td>
+                              <td className="px-8 py-5 text-right font-mono text-xs text-slate-500">{poi.distance_m}m</td>
                             </tr>
                           ))}
                         </tbody>
