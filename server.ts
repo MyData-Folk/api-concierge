@@ -116,6 +116,42 @@ app.get("/api/hotel-data", async (req, res) => {
   }
 });
 
+// ── Configuration du Système Expert (Nouveau) ────────────────
+let scrapingSettings = {
+  osm_radius: { tourism: 1000, transport: 600, shop: 500, health: 500 },
+  wiki_search_mode: "suburb", // "suburb" ou "district"
+  enable_website_scraping: true,
+  categories: ["tourism", "transport", "shop", "health"]
+};
+
+app.get("/api/settings", (req, res) => res.json(scrapingSettings));
+app.post("/api/settings", (req, res) => {
+  scrapingSettings = { ...scrapingSettings, ...req.body };
+  res.json({ success: true, settings: scrapingSettings });
+});
+
+// Helper pour scraper le site officiel
+async function scrapeWebsite(url: string) {
+  if (!url || !scrapingSettings.enable_website_scraping) return null;
+  try {
+    const formattedUrl = url.startsWith("http") ? url : `https://${url}`;
+    const response = await axios.get(formattedUrl, { timeout: 8000, headers: { "User-Agent": "Mozilla/5.0" } });
+    const html = response.data;
+    
+    const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+    const descMatch = html.match(/<meta name="description" content="(.*?)"/i) || html.match(/<meta property="og:description" content="(.*?)"/i);
+    
+    return {
+      title: titleMatch ? titleMatch[1] : null,
+      description: descMatch ? descMatch[1] : null,
+      scraped_at: new Date().toISOString()
+    };
+  } catch (e) {
+    console.warn(`[Scraper] Échec pour ${url}:`, e.message);
+    return null;
+  }
+}
+
 // --- LOGIQUE METIER (MIME DU PIPELINE PYTHON) ---
 
 // Formule Haversine pour la distance
@@ -144,7 +180,8 @@ app.get("/api/hotels/search", (req, res) => {
 
 // API d'Onboarding
 app.post("/api/onboard", async (req, res) => {
-  const { hotel_name, hotel_address, website_url } = req.body;
+  const { hotel_name, hotel_address, website_url, custom_settings } = req.body;
+  const settings = custom_settings || scrapingSettings;
 
   try {
     // 1. GÉOCODAGE (Nominatim)
@@ -163,17 +200,17 @@ app.post("/api/onboard", async (req, res) => {
       lat: parseFloat(loc.lat),
       lng: parseFloat(loc.lon),
       address: loc.display_name,
-      suburb: details.suburb || details.neighbourhood || "Quartier Inconnu",
+      suburb: details.suburb || details.neighbourhood || details.quarter || details.city_district || "Quartier Inconnu",
       district: details.city_district || "Paris"
     };
 
-    console.log(`📍 Géocodage réussi pour ${hotel_name}: ${coords.lat}, ${coords.lng}`);
+    console.log(`📍 Géocodage réussi pour ${hotel_name}: ${coords.lat}, ${coords.lng} (${coords.suburb})`);
 
     // 2. COLLECTE PARALLÈLE
-    const categories = ["tourism", "transport", "shop", "health"];
-    const overpassQueries = categories.map(async (cat) => {
+    const categories = settings.categories || ["tourism", "transport", "shop", "health"];
+    const overpassQueries = categories.map(async (cat: string) => {
       try {
-        const radius = cat === "tourism" ? 1000 : (cat === "transport" ? 600 : 500);
+        const radius = settings.osm_radius[cat as keyof typeof settings.osm_radius] || 500;
         let tags = "";
         if (cat === "transport") tags = 'node["railway"~"subway|station"]';
         else if (cat === "tourism") tags = 'node["tourism"~"museum|attraction"]';
@@ -181,7 +218,7 @@ app.post("/api/onboard", async (req, res) => {
         else if (cat === "health") tags = 'node["amenity"~"pharmacy"]';
 
         const query = `[out:json];(${tags}(around:${radius},${coords.lat},${coords.lng}););out;`;
-        const osmRes = await axios.post("https://overpass-api.de/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 10000 });
+        const osmRes = await axios.post("https://overpass-api.de/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 12000 });
         
         return osmRes.data.elements.map((el: any) => ({
           id: String(el.id),
@@ -193,29 +230,51 @@ app.post("/api/onboard", async (req, res) => {
           source: "OSM"
         }));
 
-      } catch (e) {
+      } catch (e: any) {
         console.error(`[OSM] Erreur catégorie ${cat}:`, e.message);
         return [];
       }
     });
 
+    // 3. WIKIPEDIA (Amélioré)
     const wikiQuery = (async () => {
       try {
-        const term = coords.district.replace(/ /g, "_") + (coords.district.includes("Paris") ? "" : "_de_Paris");
+        let term = coords.suburb.replace(/ /g, "_");
+        if (term === "Quartier_Inconnu" || term === "Paris") {
+           term = coords.district.replace(/ /g, "_") + (coords.district.includes("Paris") ? "" : "_de_Paris");
+        }
+        
+        console.log(`[WIKI] Recherche pour: ${term}`);
         const wikiRes = await axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${term}`);
         return {
           title: wikiRes.data.title,
           summary: wikiRes.data.extract,
-          url: wikiRes.data.content_urls.desktop.page
+          url: wikiRes.data.content_urls.desktop.page,
+          source: term
         };
       } catch (e) {
-        return null;
+        try {
+          const fallbackTerm = coords.district.replace(/ /g, "_") + (coords.district.includes("Paris") ? "" : "_de_Paris");
+          const wikiRes = await axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${fallbackTerm}`);
+          return {
+            title: wikiRes.data.title,
+            summary: wikiRes.data.extract,
+            url: wikiRes.data.content_urls.desktop.page,
+            source: fallbackTerm
+          };
+        } catch (e2) {
+          return null;
+        }
       }
     })();
 
-    const [poisNested, wiki] = await Promise.all([
+    // 4. SITE OFFICIEL (Nouveau)
+    const websiteScraping = scrapeWebsite(website_url);
+
+    const [poisNested, wiki, siteData] = await Promise.all([
       Promise.all(overpassQueries),
-      wikiQuery
+      wikiQuery,
+      websiteScraping
     ]);
 
     // DÉDOUBLONNAGE (Fuzzy)
@@ -238,6 +297,7 @@ app.post("/api/onboard", async (req, res) => {
       coords,
       pois: uniquePois,
       wiki,
+      site_official: siteData,
       status: "Active",
       website_url: website_url || null
     };
@@ -257,7 +317,6 @@ app.post("/api/onboard", async (req, res) => {
         console.log(`✅ Données sauvegardées pour ${hotel_name}`);
       } catch (dbError) {
         console.error("❌ Erreur Supabase :", dbError);
-        // On continue quand même pour renvoyer la réponse au client
       }
     }
 
@@ -279,7 +338,7 @@ app.post("/api/chat", async (req, res) => {
 
   const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
   const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-  const MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini"; // Ou "google/gemini-flash-1.5" sur OpenRouter
+  const MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini";
 
   if (!OPENROUTER_API_KEY && !GEMINI_API_KEY) {
     return res.json({
@@ -296,20 +355,19 @@ app.post("/api/chat", async (req, res) => {
       .map((p: any) => `${p.name} (${p.category}, ${p.distance_m}m)`)
       .join(", ");
     const wikiSummary = hotelContext?.wiki?.summary ?? "";
+    const siteDescription = hotelContext?.site_official?.description ?? "";
 
     const systemPrompt = `Tu es Léon, le concierge digital élégant et bienveillant de ${hotelName}.
 Tu parles UNIQUEMENT en français, avec une voix chaleureuse, légèrement poétique mais pratique.
-Tu connais parfaitement ${suburb} dans ${district} et tu aides les clients avec des conseils locaux authentiques.
+Tu connais parfaitement ${suburb} dans ${district}.
 
 Contexte du quartier :
 ${wikiSummary ? `- "${wikiSummary.slice(0, 300)}…"` : ""}
 ${poisSample ? `- Points d'intérêt proches : ${poisSample}` : ""}
+${siteDescription ? `- À propos de l'hôtel : ${siteDescription.slice(0, 200)}` : ""}
 
 Règles :
-- Réponds en 2-4 phrases maximum, avec précision et élégance
-- Utilise des emojis avec parcimonie (max 1-2 par message)
-- Si tu ne sais pas quelque chose, suggère de contacter la réception
-- N'invente jamais d'informations factuelles (horaires, prix)
+- Réponds en 2-4 phrases maximum
 - Signe toujours comme Léon si pertinent`;
 
     const chatHistory = history.slice(-10).map((m: any) => ({
@@ -336,8 +394,6 @@ Règles :
         {
           headers: {
             "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-            "HTTP-Referer": "https://hotel.hotelmanager.fr",
-            "X-Title": "ParisLocal Concierge",
             "Content-Type": "application/json",
           },
           timeout: 20000,
@@ -346,16 +402,11 @@ Règles :
       reply = orRes.data?.choices?.[0]?.message?.content;
     } else if (GEMINI_API_KEY) {
       // ── Appel Gemini Direct (Fallback) ──
-      const geminiHistory = history.slice(-8).map((m: any) => ({
-        role: m.role === "leon" ? "model" : "user",
-        parts: [{ text: m.content }],
-      }));
-
       const geminiRes = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
           system_instruction: { parts: [{ text: systemPrompt }] },
-          contents: [...geminiHistory, { role: "user", parts: [{ text: message }] }],
+          contents: [...chatHistory.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })), { role: "user", parts: [{ text: message }] }],
         },
         { timeout: 15000 }
       );
@@ -366,9 +417,7 @@ Règles :
 
   } catch (error: any) {
     console.error("[Chat] AI Error:", error?.response?.data ?? error.message);
-    res.status(500).json({
-      reply: "Je rencontre une petite fatigue passagère. Contactez la réception directly — je reviens vers vous vite ! 🛎️"
-    });
+    res.status(500).json({ reply: "Je rencontre une petite fatigue passagère. 🛎️" });
   }
 });
 

@@ -40,6 +40,34 @@ export default function App() {
   // UI State
   const [showConfig, setShowConfig] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  
+  // Scraping Settings State
+  const [settings, setSettings] = useState({
+    osm_radius: { tourism: 1000, transport: 600, shop: 500, health: 500 },
+    wiki_search_mode: 'suburb',
+    enable_website_scraping: true,
+    categories: ['tourism', 'transport', 'shop', 'health']
+  });
+
+  React.useEffect(() => {
+    fetch('/api/settings')
+      .then(res => res.json())
+      .then(data => setSettings(data))
+      .catch(e => console.error('Failed to load settings', e));
+  }, []);
+
+  const updateSettings = async (newSettings: any) => {
+    setSettings(newSettings);
+    try {
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newSettings)
+      });
+    } catch (e) {
+      console.error('Failed to save settings', e);
+    }
+  };
 
   // Use a ref for the timeout to handle debouncing
   const searchTimeoutRef = React.useRef<NodeJS.Timeout | null>(null);
@@ -99,7 +127,8 @@ export default function App() {
         body: JSON.stringify({ 
           hotel_name: hotelName, 
           hotel_address: address,
-          website_url: websiteUrl 
+          website_url: websiteUrl,
+          custom_settings: settings
         })
       });
       
@@ -322,12 +351,18 @@ export default function App() {
                         <div className="bg-emerald-500 p-3 rounded-2xl text-white">
                           <Globe size={24} />
                         </div>
-                        <div>
-                          <h4 className="font-bold text-white">Site Officiel Identifié</h4>
-                          <p className="text-xs text-emerald-400/80 font-mono">{results.website_url}</p>
+                        <div className="flex-1">
+                          <h4 className="font-bold text-white">Site Officiel & Extraction</h4>
+                          <p className="text-xs text-emerald-400/80 font-mono mb-1">{results.website_url}</p>
+                          {results.site_official && (
+                            <div className="mt-2 p-3 bg-black/20 rounded-xl border border-white/5">
+                              <p className="text-xs text-slate-300 font-bold">{results.site_official.title || 'Pas de titre trouvé'}</p>
+                              <p className="text-[10px] text-slate-500 mt-1 line-clamp-2">{results.site_official.description || 'Pas de description meta trouvée'}</p>
+                            </div>
+                          )}
                         </div>
                       </div>
-                      <a href={results.website_url} target="_blank" rel="noreferrer" className="bg-emerald-500 hover:bg-emerald-400 text-white p-3 rounded-2xl transition-colors">
+                      <a href={results.website_url} target="_blank" rel="noreferrer" className="bg-emerald-500 hover:bg-emerald-400 text-white p-3 rounded-2xl transition-colors shrink-0 ml-4">
                         <ExternalLink size={20} />
                       </a>
                     </motion.div>
@@ -427,7 +462,11 @@ export default function App() {
       {/* Slide-over Panels */}
       <AnimatePresence>
         {showConfig && (
-          <ConfigPanel onClose={() => setShowConfig(false)} />
+          <ConfigPanel 
+            settings={settings} 
+            onUpdate={updateSettings} 
+            onClose={() => setShowConfig(false)} 
+          />
         )}
         {showHelp && (
           <HelpPanel onClose={() => setShowHelp(false)} />
@@ -437,17 +476,17 @@ export default function App() {
   );
 }
 
-function ConfigPanel({ onClose }: { onClose: () => void }) {
+function ConfigPanel({ settings, onUpdate, onClose }: { settings: any, onUpdate: (s: any) => void, onClose: () => void }) {
   return (
     <motion.div 
       initial={{ x: '100%' }}
       animate={{ x: 0 }}
       exit={{ x: '100%' }}
       transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-      className="fixed inset-y-0 right-0 w-full max-w-md bg-[#161b22] border-l border-slate-800 z-[100] shadow-2xl p-8"
+      className="fixed inset-y-0 right-0 w-full max-w-md bg-[#161b22] border-l border-slate-800 z-[100] shadow-2xl p-8 overflow-y-auto"
     >
       <div className="flex items-center justify-between mb-8">
-        <h2 className="text-xl font-bold flex items-center gap-2">
+        <h2 className="text-xl font-bold flex items-center gap-2 text-white">
           <Settings size={20} className="text-blue-500" />
           Configuration Système
         </h2>
@@ -458,20 +497,65 @@ function ConfigPanel({ onClose }: { onClose: () => void }) {
 
       <div className="space-y-8">
         <section>
-          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Connecteurs API</h3>
-          <div className="space-y-3">
-            <ConfigItem icon={<Globe size={16} />} label="Nominatim (OSM)" status="Connecté" />
-            <ConfigItem icon={<Database size={16} />} label="Overpass API" status="Connecté" />
-            <ConfigItem icon={<Zap size={16} />} label="Wikipedia Restful" status="Connecté" />
+          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Rayons d'Extraction (mètres)</h3>
+          <div className="grid grid-cols-2 gap-4">
+            {Object.entries(settings.osm_radius).map(([cat, val]) => (
+              <div key={cat}>
+                <label className="text-[10px] text-slate-500 block mb-1 uppercase">{cat}</label>
+                <input 
+                  type="number" 
+                  value={val as number}
+                  onChange={(e) => onUpdate({ ...settings, osm_radius: { ...settings.osm_radius, [cat]: parseInt(e.target.value) } })}
+                  className="w-full bg-[#0d1117] border border-slate-700 rounded-lg px-3 py-2 text-xs text-white outline-none focus:ring-1 focus:ring-blue-500"
+                />
+              </div>
+            ))}
           </div>
         </section>
 
         <section>
-          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Paramètres d'Onboarding</h3>
+          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Moteur de Recherche Wiki</h3>
+          <div className="flex gap-2 p-1 bg-[#0d1117] rounded-xl border border-slate-700">
+            {['suburb', 'district'].map(mode => (
+              <button 
+                key={mode}
+                onClick={() => onUpdate({ ...settings, wiki_search_mode: mode })}
+                className={`flex-1 py-2 text-[10px] font-bold uppercase rounded-lg transition-all ${settings.wiki_search_mode === mode ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}
+              >
+                {mode === 'suburb' ? 'Quartier (Précis)' : 'District (Large)'}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section>
+          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Collecte & Scraping</h3>
           <div className="space-y-4">
-            <ToggleItem label="Mode Mock automatique" description="Active les données de secours si l'API échoue" defaultChecked />
-            <ToggleItem label="Dédoublonnage Fuzzy" description="Utilise Fuse.js pour nettoyer les POI similaires" defaultChecked />
-            <ToggleItem label="Auto-Géocodage" description="Déclenche la recherche dès la saisie de l'adresse" />
+            <ToggleItem 
+              label="Scraping Site Officiel" 
+              description="Extrait le titre et la description meta du site web" 
+              checked={settings.enable_website_scraping}
+              onChange={(val) => onUpdate({ ...settings, enable_website_scraping: val })}
+            />
+            <div className="pt-4 border-t border-slate-800">
+               <label className="text-[10px] text-slate-500 block mb-2 uppercase">Catégories OSM actives</label>
+               <div className="flex flex-wrap gap-2">
+                 {['tourism', 'transport', 'shop', 'health'].map(cat => (
+                   <button 
+                     key={cat}
+                     onClick={() => {
+                        const newCats = settings.categories.includes(cat) 
+                          ? settings.categories.filter((c: string) => c !== cat)
+                          : [...settings.categories, cat];
+                        onUpdate({ ...settings, categories: newCats });
+                     }}
+                     className={`px-3 py-1 rounded-full text-[9px] font-bold uppercase border transition-all ${settings.categories.includes(cat) ? 'bg-blue-500/20 border-blue-500 text-blue-400' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
+                   >
+                     {cat}
+                   </button>
+                 ))}
+               </div>
+            </div>
           </div>
         </section>
 
@@ -481,11 +565,10 @@ function ConfigPanel({ onClose }: { onClose: () => void }) {
             <div className="flex items-center gap-3">
               <Shield size={18} className="text-emerald-500" />
               <div>
-                <p className="text-sm font-medium">Session Authentifiée</p>
-                <p className="text-[10px] text-slate-500">Token JWT valide jusqu'à 18:00</p>
+                <p className="text-sm font-medium text-white">Infrastructure Active</p>
+                <p className="text-[10px] text-slate-500">Node.js Engine - Coolify</p>
               </div>
             </div>
-            <button className="text-[10px] bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700 font-bold uppercase tracking-wider">Réinitialiser</button>
           </div>
         </section>
       </div>
@@ -562,8 +645,7 @@ function ConfigItem({ icon, label, status }: { icon: React.ReactNode, label: str
   );
 }
 
-function ToggleItem({ label, description, defaultChecked = false }: { label: string, description: string, defaultChecked?: boolean }) {
-  const [checked, setChecked] = useState(defaultChecked);
+function ToggleItem({ label, description, checked, onChange }: { label: string, description: string, checked: boolean, onChange: (v: boolean) => void }) {
   return (
     <div className="flex items-center justify-between">
       <div>
@@ -571,7 +653,7 @@ function ToggleItem({ label, description, defaultChecked = false }: { label: str
         <p className="text-[10px] text-slate-500">{description}</p>
       </div>
       <button 
-        onClick={() => setChecked(!checked)}
+        onClick={() => onChange(!checked)}
         className={`w-10 h-5 rounded-full transition-colors relative ${checked ? 'bg-blue-600' : 'bg-slate-700'}`}
       >
         <motion.div 
