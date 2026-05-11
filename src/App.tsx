@@ -18,7 +18,9 @@ import {
   Shield,
   Zap,
   ExternalLink,
-  Table
+  Table,
+  AlertTriangle,
+  Activity
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { OnboardingResult, HotelDBEntry } from './types';
@@ -44,16 +46,29 @@ export default function App() {
   // Scraping Settings State
   const [settings, setSettings] = useState({
     osm_radius: { tourism: 1000, transport: 600, shop: 500, health: 500 },
-    wiki_search_mode: 'suburb',
+    wiki_search_mode: 'metro',
     enable_website_scraping: true,
-    categories: ['tourism', 'transport', 'shop', 'health']
+    categories: ['tourism', 'transport', 'shop', 'health'],
+    custom_sources: [] as { name: string, tags: string, radius: number }[]
   });
+
+  const [metrics, setMetrics] = useState<any>(null);
 
   React.useEffect(() => {
     fetch('/api/settings')
       .then(res => res.json())
       .then(data => setSettings(data))
       .catch(e => console.error('Failed to load settings', e));
+    
+    const loadMetrics = () => {
+      fetch('/api/metrics')
+        .then(res => res.json())
+        .then(data => setMetrics(data))
+        .catch(e => console.error('Failed to load metrics', e));
+    };
+    loadMetrics();
+    const interval = setInterval(loadMetrics, 30000);
+    return () => clearInterval(interval);
   }, []);
 
   const updateSettings = async (newSettings: any) => {
@@ -282,8 +297,18 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Content Area */}
         <section className="lg:col-span-9 space-y-6">
+          <motion.div 
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-2"
+          >
+            <MetricCard title="Onboardings" value={metrics?.onboardings_count || 0} icon={<Zap size={16} />} color="blue" />
+            <MetricCard title="Lieux Extraits" value={metrics?.api_hits || 0} icon={<Database size={16} />} color="emerald" />
+            <MetricCard title="Erreurs" value={metrics?.errors || 0} icon={<AlertTriangle size={16} />} color="red" />
+            <MetricCard title="Status" value={metrics?.status || "Actif"} icon={<Activity size={16} />} color="purple" />
+          </motion.div>
+
           <AnimatePresence mode="wait">
             {!results && !loading && (
               <motion.div 
@@ -477,6 +502,23 @@ export default function App() {
 }
 
 function ConfigPanel({ settings, onUpdate, onClose }: { settings: any, onUpdate: (s: any) => void, onClose: () => void }) {
+  const [newSourceName, setNewSourceName] = useState('');
+  const [newSourceTags, setNewSourceTags] = useState('');
+  const [newSourceRadius, setNewSourceRadius] = useState(500);
+
+  const addSource = () => {
+    if (!newSourceName || !newSourceTags) return;
+    const newSources = [...(settings.custom_sources || []), { name: newSourceName, tags: newSourceTags, radius: newSourceRadius }];
+    onUpdate({ ...settings, custom_sources: newSources });
+    setNewSourceName('');
+    setNewSourceTags('');
+  };
+
+  const removeSource = (index: number) => {
+    const newSources = settings.custom_sources.filter((_: any, i: number) => i !== index);
+    onUpdate({ ...settings, custom_sources: newSources });
+  };
+
   return (
     <motion.div 
       initial={{ x: '100%' }}
@@ -497,6 +539,26 @@ function ConfigPanel({ settings, onUpdate, onClose }: { settings: any, onUpdate:
 
       <div className="space-y-8">
         <section>
+          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Moteur de Recherche Wiki</h3>
+          <div className="flex flex-wrap gap-2 p-1 bg-[#0d1117] rounded-xl border border-slate-700">
+            {['suburb', 'district', 'metro'].map(mode => (
+              <button 
+                key={mode}
+                onClick={() => onUpdate({ ...settings, wiki_search_mode: mode })}
+                className={`flex-1 py-2 px-2 text-[9px] font-bold uppercase rounded-lg transition-all ${settings.wiki_search_mode === mode ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}
+              >
+                {mode === 'suburb' ? 'Quartier' : mode === 'district' ? 'District' : 'Métro'}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[10px] text-slate-500 italic">
+            {settings.wiki_search_mode === 'metro' && "Utilise la station de métro la plus proche comme contexte Wikipedia."}
+            {settings.wiki_search_mode === 'suburb' && "Utilise le nom du quartier renvoyé par le géocodage."}
+            {settings.wiki_search_mode === 'district' && "Utilise l'arrondissement (fallback large)."}
+          </p>
+        </section>
+
+        <section>
           <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Rayons d'Extraction (mètres)</h3>
           <div className="grid grid-cols-2 gap-4">
             {Object.entries(settings.osm_radius).map(([cat, val]) => (
@@ -514,65 +576,78 @@ function ConfigPanel({ settings, onUpdate, onClose }: { settings: any, onUpdate:
         </section>
 
         <section>
-          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Moteur de Recherche Wiki</h3>
-          <div className="flex gap-2 p-1 bg-[#0d1117] rounded-xl border border-slate-700">
-            {['suburb', 'district'].map(mode => (
-              <button 
-                key={mode}
-                onClick={() => onUpdate({ ...settings, wiki_search_mode: mode })}
-                className={`flex-1 py-2 text-[10px] font-bold uppercase rounded-lg transition-all ${settings.wiki_search_mode === mode ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}
-              >
-                {mode === 'suburb' ? 'Quartier (Précis)' : 'District (Large)'}
-              </button>
+          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Sources de Données Personnalisées</h3>
+          <div className="space-y-3 mb-4">
+            {settings.custom_sources?.map((src: any, i: number) => (
+              <div key={i} className="flex items-center justify-between p-3 bg-[#0d1117] border border-slate-800 rounded-xl">
+                <div>
+                  <p className="text-xs font-bold text-white">{src.name}</p>
+                  <p className="text-[9px] text-slate-500 font-mono">{src.tags.slice(0, 30)}...</p>
+                </div>
+                <button onClick={() => removeSource(i)} className="text-red-500 hover:bg-red-500/10 p-1.5 rounded-lg">
+                   <X size={14} />
+                </button>
+              </div>
             ))}
           </div>
-        </section>
-
-        <section>
-          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Collecte & Scraping</h3>
-          <div className="space-y-4">
-            <ToggleItem 
-              label="Scraping Site Officiel" 
-              description="Extrait le titre et la description meta du site web" 
-              checked={settings.enable_website_scraping}
-              onChange={(val) => onUpdate({ ...settings, enable_website_scraping: val })}
-            />
-            <div className="pt-4 border-t border-slate-800">
-               <label className="text-[10px] text-slate-500 block mb-2 uppercase">Catégories OSM actives</label>
-               <div className="flex flex-wrap gap-2">
-                 {['tourism', 'transport', 'shop', 'health'].map(cat => (
-                   <button 
-                     key={cat}
-                     onClick={() => {
-                        const newCats = settings.categories.includes(cat) 
-                          ? settings.categories.filter((c: string) => c !== cat)
-                          : [...settings.categories, cat];
-                        onUpdate({ ...settings, categories: newCats });
-                     }}
-                     className={`px-3 py-1 rounded-full text-[9px] font-bold uppercase border transition-all ${settings.categories.includes(cat) ? 'bg-blue-500/20 border-blue-500 text-blue-400' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
-                   >
-                     {cat}
-                   </button>
-                 ))}
-               </div>
-            </div>
+          <div className="p-4 bg-slate-900/50 rounded-2xl border border-slate-800 space-y-3">
+             <input 
+               placeholder="Nom (ex: Boulangeries)" 
+               value={newSourceName}
+               onChange={e => setNewSourceName(e.target.value)}
+               className="w-full bg-black/30 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
+             />
+             <input 
+               placeholder='Tags OSM (ex: node["shop"="bakery"])' 
+               value={newSourceTags}
+               onChange={e => setNewSourceTags(e.target.value)}
+               className="w-full bg-black/30 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono"
+             />
+             <div className="flex gap-2">
+               <input 
+                 type="number"
+                 placeholder="Rayon"
+                 value={newSourceRadius}
+                 onChange={e => setNewSourceRadius(parseInt(e.target.value))}
+                 className="flex-1 bg-black/30 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
+               />
+               <button onClick={addSource} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-xs font-bold">
+                 Ajouter
+               </button>
+             </div>
           </div>
         </section>
 
         <section>
-          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Sécurité & Tokens</h3>
-          <div className="p-4 bg-slate-900/50 rounded-xl border border-slate-800 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <Shield size={18} className="text-emerald-500" />
-              <div>
-                <p className="text-sm font-medium text-white">Infrastructure Active</p>
-                <p className="text-[10px] text-slate-500">Node.js Engine - Coolify</p>
-              </div>
-            </div>
-          </div>
+          <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Scraping & Collecte</h3>
+          <ToggleItem 
+            label="Scraping Site Officiel" 
+            description="Extrait le titre et la description meta du site web" 
+            checked={settings.enable_website_scraping}
+            onChange={(val) => onUpdate({ ...settings, enable_website_scraping: val })}
+          />
         </section>
       </div>
     </motion.div>
+  );
+}
+
+function MetricCard({ title, value, icon, color }: { title: string, value: string | number, icon: React.ReactNode, color: 'blue' | 'emerald' | 'red' | 'purple' }) {
+  const colors = {
+    blue: 'bg-blue-500/10 border-blue-500/20 text-blue-500',
+    emerald: 'bg-emerald-500/10 border-emerald-500/20 text-emerald-500',
+    red: 'bg-red-500/10 border-red-500/20 text-red-500',
+    purple: 'bg-purple-500/10 border-purple-500/20 text-purple-500'
+  };
+
+  return (
+    <div className={`p-4 rounded-2xl border ${colors[color]} flex flex-col gap-2`}>
+      <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-wider opacity-70">
+        {icon}
+        {title}
+      </div>
+      <div className="text-2xl font-black text-white">{value}</div>
+    </div>
   );
 }
 

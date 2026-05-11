@@ -22,7 +22,6 @@ if (!supabase) {
   console.warn("⚠️ Supabase non configuré. La persistance des données sera désactivée.");
 }
 
-
 app.use(cors({
   origin: [
     "https://hotel.hotelmanager.fr",
@@ -52,8 +51,6 @@ try {
       coords: h.fields?.geo ? { lat: h.fields.geo[0], lng: h.fields.geo[1] } : null
     }));
     console.log(`✅ Base de données chargée : ${hotelDb.length} établissements.`);
-  } else {
-    console.error(`❌ Fichier de base de données introuvable : ${JSON_PATH}`);
   }
 } catch (err) {
   console.error("❌ ERREUR lors du chargement de la base de données:", err);
@@ -65,13 +62,12 @@ const hotelFuse = new Fuse(hotelDb, {
   includeScore: true
 });
 
-
-
 // Métriques simples pour le dashboard
 let metrics = {
   onboardings_count: 0,
   last_extraction: null as string | null,
-  api_hits: 0
+  api_hits: 0,
+  errors: 0
 };
 
 app.get("/api/metrics", (req, res) => {
@@ -96,7 +92,7 @@ app.get("/api/hotel-data", async (req, res) => {
       .single();
 
     if (error || !data) return res.status(404).json({ error: "Hôtel non onboardé" });
-    // 4. SIMULATION ET SAUVEGARDE LOCALE (NOUVEAU)
+    
     const exportPath = path.join(process.cwd(), "exports");
     if (!fs.existsSync(exportPath)) fs.mkdirSync(exportPath);
     
@@ -104,7 +100,6 @@ app.get("/api/hotel-data", async (req, res) => {
     const fullExportPath = path.join(exportPath, fileName);
     
     fs.writeFileSync(fullExportPath, JSON.stringify(data.data, null, 2));
-    console.log(`💾 Simulation : Données sauvegardées dans ${fullExportPath}`);
 
     metrics.onboardings_count++;
     metrics.last_extraction = name as string;
@@ -119,9 +114,10 @@ app.get("/api/hotel-data", async (req, res) => {
 // ── Configuration du Système Expert (Nouveau) ────────────────
 let scrapingSettings = {
   osm_radius: { tourism: 1000, transport: 600, shop: 500, health: 500 },
-  wiki_search_mode: "suburb", // "suburb" ou "district"
+  wiki_search_mode: "metro", // "suburb", "district", ou "metro"
   enable_website_scraping: true,
-  categories: ["tourism", "transport", "shop", "health"]
+  categories: ["tourism", "transport", "shop", "health"],
+  custom_sources: [] as { name: string, tags: string, radius: number }[]
 };
 
 app.get("/api/settings", (req, res) => res.json(scrapingSettings));
@@ -146,7 +142,7 @@ async function scrapeWebsite(url: string) {
       description: descMatch ? descMatch[1] : null,
       scraped_at: new Date().toISOString()
     };
-  } catch (e) {
+  } catch (e: any) {
     console.warn(`[Scraper] Échec pour ${url}:`, e.message);
     return null;
   }
@@ -191,6 +187,7 @@ app.post("/api/onboard", async (req, res) => {
     });
 
     if (!geoResponse.data.length) {
+      metrics.errors++;
       return res.status(404).json({ error: "Adresse introuvable" });
     }
 
@@ -206,45 +203,66 @@ app.post("/api/onboard", async (req, res) => {
 
     console.log(`📍 Géocodage réussi pour ${hotel_name}: ${coords.lat}, ${coords.lng} (${coords.suburb})`);
 
-    // 2. COLLECTE PARALLÈLE
+    // 2. COLLECTE OSM
     const categories = settings.categories || ["tourism", "transport", "shop", "health"];
-    const overpassQueries = categories.map(async (cat: string) => {
-      try {
-        const radius = settings.osm_radius[cat as keyof typeof settings.osm_radius] || 500;
-        let tags = "";
-        if (cat === "transport") tags = 'node["railway"~"subway|station"]';
-        else if (cat === "tourism") tags = 'node["tourism"~"museum|attraction"]';
-        else if (cat === "shop") tags = 'node["shop"~"bakery|supermarket"]';
-        else if (cat === "health") tags = 'node["amenity"~"pharmacy"]';
+    const allSources = [
+      ...categories.map(cat => ({
+        id: cat,
+        radius: (settings.osm_radius && settings.osm_radius[cat as keyof typeof settings.osm_radius]) || 500,
+        tags: cat === "transport" ? 'node["railway"~"subway|station"]' :
+              cat === "tourism" ? 'node["tourism"~"museum|attraction"]' :
+              cat === "shop" ? 'node["shop"~"bakery|supermarket"]' :
+              cat === "health" ? 'node["amenity"~"pharmacy"]' : ""
+      })),
+      ...(settings.custom_sources || [])
+    ].filter(s => s.tags);
 
-        const query = `[out:json];(${tags}(around:${radius},${coords.lat},${coords.lng}););out;`;
-        const osmRes = await axios.post("https://overpass-api.de/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 12000 });
+    const overpassQueries = allSources.map(async (src) => {
+      try {
+        const query = `[out:json];(${src.tags}(around:${src.radius},${coords.lat},${coords.lng}););out;`;
+        const osmRes = await axios.post("https://overpass.openstreetmap.fr/api/interpreter", `data=${encodeURIComponent(query)}`, { 
+          timeout: 15000,
+          headers: { "Content-Type": "application/x-www-form-urlencoded" }
+        });
         
-        return osmRes.data.elements.map((el: any) => ({
+        return (osmRes.data.elements || []).map((el: any) => ({
           id: String(el.id),
-          name: el.tags.name || `${cat} sans nom`,
-          category: cat,
+          name: el.tags.name || el.tags.operator || `${src.id} sans nom`,
+          category: src.id,
           distance_m: Math.round(calculateDistance(coords.lat, coords.lng, el.lat, el.lon)),
           lat: el.lat,
           lng: el.lon,
           source: "OSM"
         }));
-
       } catch (e: any) {
-        console.error(`[OSM] Erreur catégorie ${cat}:`, e.message);
+        console.error(`[OSM] Erreur source ${src.id}:`, e.message);
         return [];
       }
     });
 
-    // 3. WIKIPEDIA (Amélioré)
+    const poisResults = await Promise.all(overpassQueries);
+    const allPois = poisResults.flat();
+
+    // 3. WIKIPEDIA (Basé sur la station de métro si mode metro)
     const wikiQuery = (async () => {
       try {
-        let term = coords.suburb.replace(/ /g, "_");
-        if (term === "Quartier_Inconnu" || term === "Paris") {
-           term = coords.district.replace(/ /g, "_") + (coords.district.includes("Paris") ? "" : "_de_Paris");
+        let term = "";
+        
+        if (settings.wiki_search_mode === "metro") {
+          const metro = allPois.find(p => p.category === "transport" && (p.name.toLowerCase().includes("métro") || p.name.toLowerCase().includes("station")));
+          if (metro) {
+            term = metro.name.replace(/métro|station/gi, "").trim().replace(/ /g, "_");
+            console.log(`[WIKI] Recherche basée sur le métro: ${term}`);
+          }
+        }
+
+        if (!term) {
+          term = coords.suburb.replace(/ /g, "_");
+          if (term === "Quartier_Inconnu" || term === "Paris") {
+             term = coords.district.replace(/ /g, "_") + (coords.district.includes("Paris") ? "" : "_de_Paris");
+          }
         }
         
-        console.log(`[WIKI] Recherche pour: ${term}`);
         const wikiRes = await axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${term}`);
         return {
           title: wikiRes.data.title,
@@ -268,17 +286,15 @@ app.post("/api/onboard", async (req, res) => {
       }
     })();
 
-    // 4. SITE OFFICIEL (Nouveau)
+    // 4. SITE OFFICIEL
     const websiteScraping = scrapeWebsite(website_url);
 
-    const [poisNested, wiki, siteData] = await Promise.all([
-      Promise.all(overpassQueries),
+    const [wiki, siteData] = await Promise.all([
       wikiQuery,
       websiteScraping
     ]);
 
-    // DÉDOUBLONNAGE (Fuzzy)
-    const allPois = poisNested.flat();
+    // DÉDOUBLONNAGE
     const fuse = new Fuse(allPois, { keys: ["name"], threshold: 0.2 });
     const uniquePois: any[] = [];
     const seen = new Set();
@@ -302,19 +318,19 @@ app.post("/api/onboard", async (req, res) => {
       website_url: website_url || null
     };
 
+    // MÀJ Métriques
+    metrics.onboardings_count++;
+    metrics.last_extraction = hotel_name;
+    metrics.api_hits += uniquePois.length;
+
     // ── Sauvegarde dans Supabase ──
     if (supabase) {
       try {
-        const { error } = await supabase
-          .from("hotels_data")
-          .upsert({
-            hotel_name: hotel_name,
-            data: result,
-            updated_at: new Date().toISOString()
-          }, { onConflict: 'hotel_name' });
-
-        if (error) throw error;
-        console.log(`✅ Données sauvegardées pour ${hotel_name}`);
+        await supabase.from("hotels_data").upsert({
+          hotel_name: hotel_name,
+          data: result,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'hotel_name' });
       } catch (dbError) {
         console.error("❌ Erreur Supabase :", dbError);
       }
@@ -323,123 +339,55 @@ app.post("/api/onboard", async (req, res) => {
     res.json(result);
 
   } catch (error) {
+    metrics.errors++;
     console.error(error);
     res.status(500).json({ error: "Échec du pipeline" });
   }
 });
 
-// ── API Chat avec Léon (OpenRouter / Gemini) ──────────────────────────
+// ── API Chat avec Léon ──────────────────────────
 app.post("/api/chat", async (req, res) => {
   const { message, history = [], hotelContext } = req.body;
-
-  if (!message) {
-    return res.status(400).json({ error: "Message requis" });
-  }
-
   const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
   const MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini";
-
-  if (!OPENROUTER_API_KEY && !GEMINI_API_KEY) {
-    return res.json({
-      reply: "Je suis Léon, votre concierge ! (Mode Local actif — veuillez configurer vos clés API pour une expérience complète). 😊"
-    });
-  }
 
   try {
     const hotelName  = hotelContext?.hotel_name  ?? "notre hôtel";
     const suburb     = hotelContext?.coords?.suburb  ?? "ce quartier";
-    const district   = hotelContext?.coords?.district ?? "Paris";
-    const poisSample = (hotelContext?.pois ?? [])
-      .slice(0, 8)
-      .map((p: any) => `${p.name} (${p.category}, ${p.distance_m}m)`)
-      .join(", ");
     const wikiSummary = hotelContext?.wiki?.summary ?? "";
-    const siteDescription = hotelContext?.site_official?.description ?? "";
+    const poisSample = (hotelContext?.pois ?? []).slice(0, 5).map((p: any) => p.name).join(", ");
 
-    const systemPrompt = `Tu es Léon, le concierge digital élégant et bienveillant de ${hotelName}.
-Tu parles UNIQUEMENT en français, avec une voix chaleureuse, légèrement poétique mais pratique.
-Tu connais parfaitement ${suburb} dans ${district}.
+    const systemPrompt = `Tu es Léon, concierge à ${hotelName}. Quartier: ${suburb}. ${wikiSummary.slice(0, 200)}. Proche: ${poisSample}.`;
 
-Contexte du quartier :
-${wikiSummary ? `- "${wikiSummary.slice(0, 300)}…"` : ""}
-${poisSample ? `- Points d'intérêt proches : ${poisSample}` : ""}
-${siteDescription ? `- À propos de l'hôtel : ${siteDescription.slice(0, 200)}` : ""}
-
-Règles :
-- Réponds en 2-4 phrases maximum
-- Signe toujours comme Léon si pertinent`;
-
-    const chatHistory = history.slice(-10).map((m: any) => ({
+    const chatHistory = history.slice(-6).map((m: any) => ({
       role: m.role === "leon" ? "assistant" : "user",
       content: m.content,
     }));
 
-    let reply = "";
-
     if (OPENROUTER_API_KEY) {
-      // ── Appel OpenRouter ──
-      const orRes = await axios.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-          model: MODEL,
-          messages: [
-            { role: "system", content: systemPrompt },
-            ...chatHistory,
-            { role: "user", content: message },
-          ],
-          temperature: 0.8,
-          max_tokens: 300,
-        },
-        {
-          headers: {
-            "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          timeout: 20000,
-        }
-      );
-      reply = orRes.data?.choices?.[0]?.message?.content;
-    } else if (GEMINI_API_KEY) {
-      // ── Appel Gemini Direct (Fallback) ──
-      const geminiRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          system_instruction: { parts: [{ text: systemPrompt }] },
-          contents: [...chatHistory.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })), { role: "user", parts: [{ text: message }] }],
-        },
-        { timeout: 15000 }
-      );
-      reply = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      const orRes = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
+        model: MODEL,
+        messages: [{ role: "system", content: systemPrompt }, ...chatHistory, { role: "user", content: message }],
+      }, { headers: { "Authorization": `Bearer ${OPENROUTER_API_KEY}` } });
+      res.json({ reply: orRes.data?.choices?.[0]?.message?.content });
+    } else {
+      res.json({ reply: "Léon est en pause café. ☕" });
     }
-
-    res.json({ reply: reply || "Pardonnez-moi, ma réflexion s'est interrompue. Pouvez-vous répéter ?" });
-
-  } catch (error: any) {
-    console.error("[Chat] AI Error:", error?.response?.data ?? error.message);
-    res.status(500).json({ reply: "Je rencontre une petite fatigue passagère. 🛎️" });
+  } catch (e) {
+    res.status(500).json({ reply: "Erreur de connexion. 🛎️" });
   }
 });
 
 // VITE MIDDLEWARE
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Serveur ParisLocal actif sur http://localhost:${PORT}`);
-  });
+  app.listen(PORT, "0.0.0.0", () => console.log(`Serveur actif sur http://localhost:${PORT}`));
 }
-
 startServer();
