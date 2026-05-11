@@ -18,51 +18,7 @@ const supabaseUrl = process.env.SUPABASE_URL || "";
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
 const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
-if (!supabase) {
-  console.warn("⚠️ Supabase non configuré. La persistance des données sera désactivée.");
-}
-
-app.use(cors({
-  origin: [
-    "https://hotel.hotelmanager.fr",
-    "http://localhost:5173",
-    "http://localhost:3000",
-  ],
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
-app.use(express.json());
-
-// Charger la base de données des hôtels
-const JSON_PATH = path.join(process.cwd(), "src/data/les_hotels_classes_en_ile-de-france.json");
-
-let hotelDb: any[] = [];
-try {
-  if (fs.existsSync(JSON_PATH)) {
-    const hotelDbRaw = JSON.parse(fs.readFileSync(JSON_PATH, "utf-8"));
-    hotelDb = hotelDbRaw.map((h: any) => ({
-      nom: h.fields?.nom_commercial || "Hôtel sans nom",
-      adresse: h.fields?.adresse || "Adresse inconnue",
-      commune: h.fields?.commune || "",
-      code_postal: h.fields?.code_postal || "",
-      site_internet: h.fields?.site_internet?.startsWith("www") ? `http://${h.fields.site_internet}` : h.fields?.site_internet,
-      telephone: h.fields?.telephone || "",
-      classement: h.fields?.classement || "",
-      coords: h.fields?.geo ? { lat: h.fields.geo[0], lng: h.fields.geo[1] } : null
-    }));
-    console.log(`✅ Base de données chargée : ${hotelDb.length} établissements.`);
-  }
-} catch (err) {
-  console.error("❌ ERREUR lors du chargement de la base de données:", err);
-}
-
-const hotelFuse = new Fuse(hotelDb, {
-  keys: ["nom", "adresse"],
-  threshold: 0.3,
-  includeScore: true
-});
-
-// Métriques simples pour le dashboard
+// Métriques (In-Memory avec Persistance Temporelle en Log)
 let metrics = {
   onboardings_count: 0,
   last_extraction: null as string | null,
@@ -70,324 +26,197 @@ let metrics = {
   errors: 0
 };
 
-app.get("/api/metrics", (req, res) => {
-  res.json({
-    ...metrics,
-    db_size: hotelDb.length,
-    status: "Production Ready",
-    uptime: Math.floor(process.uptime())
-  });
-});
+app.use(cors());
+app.use(express.json());
 
-// ── Récupérer les données d'un hôtel déjà onboardé ───────────
-app.get("/api/hotel-data", async (req, res) => {
-  const { name } = req.query;
-  if (!name || !supabase) return res.status(404).json({ error: "Hôtel non trouvé" });
-
-  try {
-    const { data, error } = await supabase
-      .from("hotels_data")
-      .select("data")
-      .eq("hotel_name", name)
-      .single();
-
-    if (error || !data) return res.status(404).json({ error: "Hôtel non onboardé" });
-    
-    const exportPath = path.join(process.cwd(), "exports");
-    if (!fs.existsSync(exportPath)) fs.mkdirSync(exportPath);
-    
-    const fileName = `sim_data_${(name as string).replace(/\s+/g, '_')}_${Date.now()}.json`;
-    const fullExportPath = path.join(exportPath, fileName);
-    
-    fs.writeFileSync(fullExportPath, JSON.stringify(data.data, null, 2));
-
-    metrics.onboardings_count++;
-    metrics.last_extraction = name as string;
-    metrics.api_hits += (data.data.pois?.length || 0);
-
-    res.json({ ...data.data, simulation_file: fileName });
-  } catch (err) {
-    res.status(500).json({ error: "Erreur serveur" });
+// Charger la base de données des hôtels
+const JSON_PATH = path.join(process.cwd(), "src/data/les_hotels_classes_en_ile-de-france.json");
+let hotelDb: any[] = [];
+try {
+  if (fs.existsSync(JSON_PATH)) {
+    const raw = JSON.parse(fs.readFileSync(JSON_PATH, "utf-8"));
+    hotelDb = raw.map((h: any) => ({
+      nom: h.fields?.nom_commercial || "Sans Nom",
+      adresse: h.fields?.adresse || "",
+      commune: h.fields?.commune || "",
+      site_internet: h.fields?.site_internet,
+      coords: h.fields?.geo ? { lat: h.fields.geo[0], lng: h.fields.geo[1] } : null
+    }));
+    console.log(`✅ Base Hotels: ${hotelDb.length} chargés.`);
   }
-});
+} catch (e) { console.error("Base Hotels non trouvée."); }
 
-// ── Configuration du Système Expert (Nouveau) ────────────────
+const hotelFuse = new Fuse(hotelDb, { keys: ["nom", "adresse"], threshold: 0.3 });
+
+// ── CONFIGURATION SCRAPING ──────────────────────────────────
 let scrapingSettings = {
-  osm_radius: { tourism: 1000, transport: 600, shop: 500, health: 500 },
-  wiki_search_mode: "metro", // "suburb", "district", ou "metro"
+  osm_radius: { tourism: 1200, transport: 800, shop: 600, health: 600 },
+  wiki_search_mode: "metro",
   enable_website_scraping: true,
   categories: ["tourism", "transport", "shop", "health"],
-  custom_sources: [] as { name: string, tags: string, radius: number }[]
+  custom_sources: [] as any[]
 };
 
+app.get("/api/metrics", (req, res) => res.json({ ...metrics, status: "Active", uptime: process.uptime() }));
 app.get("/api/settings", (req, res) => res.json(scrapingSettings));
 app.post("/api/settings", (req, res) => {
   scrapingSettings = { ...scrapingSettings, ...req.body };
-  res.json({ success: true, settings: scrapingSettings });
+  res.json({ success: true });
 });
 
-// Helper pour scraper le site officiel
-async function scrapeWebsite(url: string) {
-  if (!url || !scrapingSettings.enable_website_scraping) return null;
+// Helper Distance
+function getDist(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371e3;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const dp = ((lat2 - lat1) * Math.PI) / 180;
+  const dl = ((lon2 - lon1) * Math.PI) / 180;
+  const a = Math.sin(dp/2)**2 + Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)));
+}
+
+// SCRAPER SITE
+async function scrapeSite(url: string) {
+  if (!url) return null;
   try {
-    const formattedUrl = url.startsWith("http") ? url : `https://${url}`;
-    const response = await axios.get(formattedUrl, { timeout: 8000, headers: { "User-Agent": "Mozilla/5.0" } });
-    const html = response.data;
-    
-    const titleMatch = html.match(/<title>(.*?)<\/title>/i);
-    const descMatch = html.match(/<meta name="description" content="(.*?)"/i) || html.match(/<meta property="og:description" content="(.*?)"/i);
-    
-    return {
-      title: titleMatch ? titleMatch[1] : null,
-      description: descMatch ? descMatch[1] : null,
-      scraped_at: new Date().toISOString()
-    };
-  } catch (e: any) {
-    console.warn(`[Scraper] Échec pour ${url}:`, e.message);
-    return null;
-  }
+    const target = url.startsWith("http") ? url : `https://${url}`;
+    const res = await axios.get(target, { timeout: 5000 });
+    const title = res.data.match(/<title>(.*?)<\/title>/i)?.[1];
+    const desc = res.data.match(/<meta name="description" content="(.*?)"/i)?.[1];
+    return { title, description: desc };
+  } catch { return null; }
 }
 
-// --- LOGIQUE METIER (MIME DU PIPELINE PYTHON) ---
-
-// Formule Haversine pour la distance
-function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371e3; // metres
-  const φ1 = (lat1 * Math.PI) / 180;
-  const φ2 = (lat2 * Math.PI) / 180;
-  const Δφ = ((lat2 - lat1) * Math.PI) / 180;
-  const Δλ = ((lon2 - lon1) * Math.PI) / 180;
-
-  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-            Math.cos(φ1) * Math.cos(φ2) *
-            Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-  return R * c;
-}
-
-// API Recherche dans la base locale
-app.get("/api/hotels/search", (req, res) => {
-  const q = req.query.q as string;
-  if (!q) return res.json([]);
-  const results = hotelFuse.search(q).slice(0, 10).map(r => r.item);
-  res.json(results);
-});
-
-// API d'Onboarding
+// API ONBOARDING (PIPELINE COMPLET)
 app.post("/api/onboard", async (req, res) => {
   const { hotel_name, hotel_address, website_url, custom_settings } = req.body;
-  const settings = custom_settings || scrapingSettings;
+  const set = custom_settings || scrapingSettings;
 
   try {
-    // 1. GÉOCODAGE (Nominatim)
-    const geoResponse = await axios.get(`https://nominatim.openstreetmap.org/search`, {
-      params: { q: hotel_address, format: "json", addressdetails: 1, limit: 1 },
-      headers: { "User-Agent": "ParisLocal-Onboarding-Agent" }
+    // 1. GEOCODAGE
+    const geo = await axios.get(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(hotel_address)}&format=json&addressdetails=1&limit=1`, {
+      headers: { "User-Agent": "ParisLocal-App" }
     });
-
-    if (!geoResponse.data.length) {
-      metrics.errors++;
-      return res.status(404).json({ error: "Adresse introuvable" });
-    }
-
-    const loc = geoResponse.data[0];
-    const details = loc.address;
+    
+    if (!geo.data[0]) throw new Error("Adresse non trouvée");
+    const loc = geo.data[0];
     const coords = {
       lat: parseFloat(loc.lat),
       lng: parseFloat(loc.lon),
-      address: loc.display_name,
-      suburb: details.suburb || details.neighbourhood || details.quarter || details.city_district || "Quartier Inconnu",
-      district: details.city_district || "Paris"
+      suburb: loc.address.suburb || loc.address.neighbourhood || loc.address.city_district || "Paris"
     };
 
-    console.log(`📍 Géocodage réussi pour ${hotel_name}: ${coords.lat}, ${coords.lng} (${coords.suburb})`);
-
-    // 2. COLLECTE OSM
-    const categories = settings.categories || ["tourism", "transport", "shop", "health"];
-    const allSources = [
-      ...categories.map(cat => ({
-        id: cat,
-        radius: (settings.osm_radius && settings.osm_radius[cat as keyof typeof settings.osm_radius]) || 500,
-        tags: cat === "transport" ? 'node["railway"~"subway|station"]' :
-              cat === "tourism" ? 'node["tourism"~"museum|attraction"]' :
-              cat === "shop" ? 'node["shop"~"bakery|supermarket"]' :
-              cat === "health" ? 'node["amenity"~"pharmacy"]' : ""
+    // 2. OSM SCRAPING
+    const sources = [
+      ...set.categories.map((c: string) => ({
+        id: c,
+        radius: set.osm_radius[c] || 500,
+        tags: c === "transport" ? 'node["railway"~"subway|station"]' :
+              c === "tourism" ? 'node["tourism"~"museum|attraction"]' :
+              c === "shop" ? 'node["shop"~"bakery|supermarket"]' : 'node["amenity"~"pharmacy"]'
       })),
-      ...(settings.custom_sources || [])
-    ].filter(s => s.tags);
+      ...(set.custom_sources || [])
+    ];
 
-    const overpassQueries = allSources.map(async (src) => {
+    const pois: any[] = [];
+    for (const s of sources) {
       try {
-        const query = `[out:json];(${src.tags}(around:${src.radius},${coords.lat},${coords.lng}););out;`;
-        const osmRes = await axios.post("https://overpass.openstreetmap.fr/api/interpreter", `data=${encodeURIComponent(query)}`, { 
-          timeout: 15000,
-          headers: { "Content-Type": "application/x-www-form-urlencoded" }
-        });
-        
-        return (osmRes.data.elements || []).map((el: any) => ({
-          id: String(el.id),
-          name: el.tags.name || el.tags.operator || `${src.id} sans nom`,
-          category: src.id,
-          distance_m: Math.round(calculateDistance(coords.lat, coords.lng, el.lat, el.lon)),
-          lat: el.lat,
-          lng: el.lon,
-          source: "OSM"
-        }));
-      } catch (e: any) {
-        console.error(`[OSM] Erreur source ${src.id}:`, e.message);
-        return [];
-      }
-    });
-
-    const poisResults = await Promise.all(overpassQueries);
-    const allPois = poisResults.flat();
-
-    // 3. WIKIPEDIA (Basé sur la station de métro si mode metro)
-    const wikiQuery = (async () => {
-      try {
-        let term = "";
-        
-        if (settings.wiki_search_mode === "metro") {
-          const metro = allPois.find(p => p.category === "transport" && (p.name.toLowerCase().includes("métro") || p.name.toLowerCase().includes("station")));
-          if (metro) {
-            term = metro.name.replace(/métro|station/gi, "").trim().replace(/ /g, "_");
-            console.log(`[WIKI] Recherche basée sur le métro: ${term}`);
-          }
-        }
-
-        if (!term) {
-          term = coords.suburb.replace(/ /g, "_");
-          if (term === "Quartier_Inconnu" || term === "Paris") {
-             term = coords.district.replace(/ /g, "_") + (coords.district.includes("Paris") ? "" : "_de_Paris");
-          }
-        }
-        
-        const wikiRes = await axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${term}`);
-        return {
-          title: wikiRes.data.title,
-          summary: wikiRes.data.extract,
-          url: wikiRes.data.content_urls.desktop.page,
-          source: term
-        };
-      } catch (e) {
+        const query = `[out:json];(${s.tags}(around:${s.radius},${coords.lat},${coords.lng}););out;`;
+        // Fallback servers
+        let osmRes;
         try {
-          const fallbackTerm = coords.district.replace(/ /g, "_") + (coords.district.includes("Paris") ? "" : "_de_Paris");
-          const wikiRes = await axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${fallbackTerm}`);
-          return {
-            title: wikiRes.data.title,
-            summary: wikiRes.data.extract,
-            url: wikiRes.data.content_urls.desktop.page,
-            source: fallbackTerm
-          };
-        } catch (e2) {
-          return null;
+          osmRes = await axios.post("https://overpass-api.de/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 10000 });
+        } catch {
+          osmRes = await axios.post("https://overpass.openstreetmap.fr/api/interpreter", `data=${encodeURIComponent(query)}`, { timeout: 10000 });
         }
-      }
-    })();
+        
+        const elements = osmRes.data.elements || [];
+        elements.forEach((el: any) => {
+          pois.push({
+            id: el.id,
+            name: el.tags.name || el.tags.operator || s.id,
+            category: s.id,
+            distance: getDist(coords.lat, coords.lng, el.lat, el.lon),
+            lat: el.lat, lng: el.lon
+          });
+        });
+      } catch (e) { console.error(`Err OSM ${s.id}`); }
+    }
 
-    // 4. SITE OFFICIEL
-    const websiteScraping = scrapeWebsite(website_url);
-
-    const [wiki, siteData] = await Promise.all([
-      wikiQuery,
-      websiteScraping
+    // 3. WIKI & SITE
+    let wikiTerm = coords.suburb;
+    if (set.wiki_search_mode === "metro") {
+      const metro = pois.find(p => p.category === "transport");
+      if (metro) wikiTerm = metro.name.replace(/métro|station/gi, "").trim();
+    }
+    
+    const [wikiRes, siteData] = await Promise.all([
+      axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiTerm.replace(/ /g, "_"))}`).catch(() => null),
+      scrapeSite(website_url)
     ]);
-
-    // DÉDOUBLONNAGE
-    const fuse = new Fuse(allPois, { keys: ["name"], threshold: 0.2 });
-    const uniquePois: any[] = [];
-    const seen = new Set();
-
-    allPois.sort((a, b) => a.distance_m - b.distance_m).forEach(poi => {
-      const results = fuse.search(poi.name);
-      const isDuplicate = results.some(r => seen.has(r.item.id) && r.item.id !== poi.id);
-      if (!isDuplicate) {
-        uniquePois.push(poi);
-        seen.add(poi.id);
-      }
-    });
 
     const result = {
       hotel_name,
       coords,
-      pois: uniquePois,
-      wiki,
+      pois: pois.sort((a,b) => a.distance - b.distance).slice(0, 50),
+      wiki: wikiRes ? { title: wikiRes.data.title, summary: wikiRes.data.extract } : null,
       site_official: siteData,
-      status: "Active",
-      website_url: website_url || null
+      website_url,
+      timestamp: new Date().toISOString()
     };
 
-    // MÀJ Métriques
+    // 4. PERSISTANCE & EXPORT JSON
     metrics.onboardings_count++;
+    metrics.api_hits += result.pois.length;
     metrics.last_extraction = hotel_name;
-    metrics.api_hits += uniquePois.length;
 
-    // ── Sauvegarde dans Supabase ──
+    // Sauvegarde locale (Le fameux export JSON demandé)
+    const exportDir = path.join(process.cwd(), "exports");
+    if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir);
+    const fileName = `export_${hotel_name.replace(/\s+/g, '_')}_${Date.now()}.json`;
+    fs.writeFileSync(path.join(exportDir, fileName), JSON.stringify(result, null, 2));
+
     if (supabase) {
-      try {
-        await supabase.from("hotels_data").upsert({
-          hotel_name: hotel_name,
-          data: result,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'hotel_name' });
-      } catch (dbError) {
-        console.error("❌ Erreur Supabase :", dbError);
-      }
+      await supabase.from("hotels_data").upsert({ hotel_name, data: result, updated_at: new Date().toISOString() });
     }
 
-    res.json(result);
+    res.json({ ...result, export_file: fileName });
 
-  } catch (error) {
+  } catch (error: any) {
     metrics.errors++;
-    console.error(error);
-    res.status(500).json({ error: "Échec du pipeline" });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// ── API Chat avec Léon ──────────────────────────
+// SEARCH & CHAT
+app.get("/api/hotels/search", (req, res) => {
+  const q = req.query.q as string;
+  res.json(hotelFuse.search(q || "").slice(0, 10).map(r => r.item));
+});
+
 app.post("/api/chat", async (req, res) => {
-  const { message, history = [], hotelContext } = req.body;
-  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-  const MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini";
+  const { message, hotelContext } = req.body;
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) return res.json({ reply: "Léon est déconnecté (Clé API manquante)." });
 
   try {
-    const hotelName  = hotelContext?.hotel_name  ?? "notre hôtel";
-    const suburb     = hotelContext?.coords?.suburb  ?? "ce quartier";
-    const wikiSummary = hotelContext?.wiki?.summary ?? "";
-    const poisSample = (hotelContext?.pois ?? []).slice(0, 5).map((p: any) => p.name).join(", ");
-
-    const systemPrompt = `Tu es Léon, concierge à ${hotelName}. Quartier: ${suburb}. ${wikiSummary.slice(0, 200)}. Proche: ${poisSample}.`;
-
-    const chatHistory = history.slice(-6).map((m: any) => ({
-      role: m.role === "leon" ? "assistant" : "user",
-      content: m.content,
-    }));
-
-    if (OPENROUTER_API_KEY) {
-      const orRes = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-        model: MODEL,
-        messages: [{ role: "system", content: systemPrompt }, ...chatHistory, { role: "user", content: message }],
-      }, { headers: { "Authorization": `Bearer ${OPENROUTER_API_KEY}` } });
-      res.json({ reply: orRes.data?.choices?.[0]?.message?.content });
-    } else {
-      res.json({ reply: "Léon est en pause café. ☕" });
-    }
-  } catch (e) {
-    res.status(500).json({ reply: "Erreur de connexion. 🛎️" });
-  }
+    const prompt = `Tu es Léon, concierge de ${hotelContext?.hotel_name}. Quartier: ${hotelContext?.coords?.suburb}. Lieux: ${(hotelContext?.pois || []).slice(0,5).map((p:any) => p.name).join(', ')}.`;
+    const or = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
+      model: "openai/gpt-4o-mini",
+      messages: [{ role: "system", content: prompt }, { role: "user", content: message }]
+    }, { headers: { "Authorization": `Bearer ${key}` } });
+    res.json({ reply: or.data.choices[0].message.content });
+  } catch { res.json({ reply: "Désolé, je rencontre un problème technique. 🛎️" }); }
 });
 
-// VITE MIDDLEWARE
-async function startServer() {
+async function start() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
+    app.use(express.static("dist"));
+    app.get("*", (req, res) => res.sendFile(path.resolve("dist/index.html")));
   }
-  app.listen(PORT, "0.0.0.0", () => console.log(`Serveur actif sur http://localhost:${PORT}`));
+  app.listen(PORT, "0.0.0.0", () => console.log(`🚀 ParisLocal ON sur http://localhost:${PORT}`));
 }
-startServer();
+start();
