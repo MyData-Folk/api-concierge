@@ -5,6 +5,7 @@ import axios from "axios";
 import Fuse from "fuse.js";
 import fs from "fs";
 import cors from "cors";
+import * as cheerio from "cheerio";
 import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
 
@@ -75,17 +76,45 @@ function getDist(lat1: number, lon1: number, lat2: number, lon2: number) {
   return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)));
 }
 
-// SCRAPER SITE
+// SCRAPER SITE AMÉLIORÉ
 async function scrapeSite(url: string) {
   if (!url) return null;
   try {
     const target = url.startsWith("http") ? url : `https://${url}`;
-    const res = await axios.get(target, { timeout: 5000, headers: { "User-Agent": "ParisLocal-App/1.0" } });
-    const title = res.data.match(/<title>(.*?)<\/title>/i)?.[1];
-    const desc = res.data.match(/<meta name="description" content="(.*?)"/i)?.[1];
-    return { title, description: desc };
-  } catch { return null; }
+    const res = await axios.get(target, { 
+      timeout: 8000, 
+      headers: { 
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+      } 
+    });
+    
+    const $ = cheerio.load(res.data);
+    const title = $("title").text() || $('meta[property="og:title"]').attr("content");
+    const description = $('meta[name="description"]').attr("content") || $('meta[property="og:description"]').attr("content");
+    const h1 = $("h1").first().text();
+
+    return { 
+      title: title?.trim(), 
+      description: description?.trim(),
+      h1: h1?.trim(),
+      scraped_at: new Date().toISOString() 
+    };
+  } catch (e: any) { 
+    console.warn(`[Scraping] Échec pour ${url}: ${e.message}`);
+    return null; 
+  }
 }
+
+// Endpoint pour télécharger les exports
+app.get("/api/download/:filename", (req, res) => {
+  const filePath = path.join(process.cwd(), "exports", req.params.filename);
+  if (fs.existsSync(filePath)) {
+    res.download(filePath);
+  } else {
+    res.status(404).send("Fichier non trouvé");
+  }
+});
 
 // API ONBOARDING (PIPELINE COMPLET)
 app.post("/api/onboard", async (req, res) => {
@@ -201,7 +230,7 @@ app.post("/api/onboard", async (req, res) => {
       await supabase.from("hotels_data").upsert({ hotel_name, data: result, updated_at: new Date().toISOString() });
     }
 
-    res.json(result);
+    res.json({ ...result, export_file: fileName });
 
   } catch (error: any) {
     metrics.errors++;

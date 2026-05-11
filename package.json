@@ -15,6 +15,7 @@
     "@types/cors": "^2.8.19",
     "@vitejs/plugin-react": "^5.0.4",
     "axios": "^1.16.0",
+    "cheerio": "^1.0.0-rc.12",
     "clsx": "^2.1.1",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
