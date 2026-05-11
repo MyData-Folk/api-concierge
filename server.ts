@@ -182,7 +182,7 @@ app.post("/api/onboard", async (req, res) => {
             id: el.id,
             name: el.tags.name || el.tags.operator || s.id,
             category: s.id,
-            distance: getDist(coords.lat, coords.lng, el.lat, el.lon),
+            distance_m: getDist(coords.lat, coords.lng, el.lat, el.lon),
             lat: el.lat, lng: el.lon
           });
         });
@@ -198,16 +198,23 @@ app.post("/api/onboard", async (req, res) => {
       if (metro) wikiTerm = metro.name.replace(/métro|station/gi, "").trim();
     }
     
-    const [wikiRes, siteData] = await Promise.all([
-      axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiTerm.replace(/ /g, "_"))}`).catch(() => null),
+    let wikiData = null;
+    try {
+      const wikiRes = await axios.get(`https://fr.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiTerm.replace(/ /g, "_"))}`, { timeout: 5000 });
+      wikiData = { title: wikiRes.data.title, summary: wikiRes.data.extract, url: wikiRes.data.content_urls?.desktop?.page };
+    } catch (e) {
+      console.warn(`[Wiki] Échec pour ${wikiTerm}`);
+    }
+
+    const [siteData] = await Promise.all([
       scrapeSite(website_url)
     ]);
 
     const result = {
       hotel_name,
       coords,
-      pois: pois.sort((a,b) => a.distance - b.distance).slice(0, 50),
-      wiki: wikiRes ? { title: wikiRes.data.title, summary: wikiRes.data.extract } : null,
+      pois: pois.sort((a,b) => a.distance_m - b.distance_m).slice(0, 50),
+      wiki: wikiData,
       site_official: siteData,
       website_url,
       timestamp: new Date().toISOString()
